@@ -151,7 +151,7 @@ public class GraphTransaction extends IndexableTransaction {
     }
 
     @Override
-    protected AbstractTransaction indexTransaction() {
+    protected GraphIndexTransaction indexTransaction() {
         return this.indexTx;
     }
 
@@ -1184,7 +1184,7 @@ public class GraphTransaction extends IndexableTransaction {
 
         if (cq.optimized() == OptimizedType.INDEX.ordinal()) {
             LOG.info("Remove left index: {}, query: {}", elem, cq);
-            this.indexTx.removeIndexLeft(cq, elem);
+            this.indexTx.asyncRemoveIndexLeft(cq, elem);
         }
         return false;
     }

@@ -29,6 +29,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import org.apache.tinkerpop.gremlin.structure.Edge;
+import org.apache.tinkerpop.gremlin.structure.Vertex;
 
 import com.baidu.hugegraph.HugeException;
 import com.baidu.hugegraph.HugeGraph;
@@ -45,6 +49,8 @@ import com.baidu.hugegraph.backend.query.Query;
 import com.baidu.hugegraph.backend.store.BackendEntry;
 import com.baidu.hugegraph.backend.store.BackendStore;
 import com.baidu.hugegraph.exception.NoIndexException;
+import com.baidu.hugegraph.job.EphemeralJob;
+import com.baidu.hugegraph.job.EphemeralJobBuilder;
 import com.baidu.hugegraph.perf.PerfUtil.Watched;
 import com.baidu.hugegraph.schema.IndexLabel;
 import com.baidu.hugegraph.schema.PropertyKey;
@@ -54,6 +60,7 @@ import com.baidu.hugegraph.structure.HugeElement;
 import com.baidu.hugegraph.structure.HugeIndex;
 import com.baidu.hugegraph.structure.HugeProperty;
 import com.baidu.hugegraph.structure.HugeVertex;
+import com.baidu.hugegraph.task.HugeTask;
 import com.baidu.hugegraph.type.HugeType;
 import com.baidu.hugegraph.type.define.HugeKeys;
 import com.baidu.hugegraph.type.define.IndexType;
@@ -79,6 +86,18 @@ public class GraphIndexTransaction extends AbstractTransaction {
         assert this.textAnalyzer != null;
     }
 
+    protected Id asyncRemoveIndexLeft(ConditionQuery query,
+                                      HugeElement element) {
+        RemoveLeftIndexCallable callable = new RemoveLeftIndexCallable(query,
+                                                                       element);
+        EphemeralJobBuilder<Object> builder =
+                                    EphemeralJobBuilder.of(this.graph())
+                                                       .name(element.name())
+                                                       .job(callable);
+        HugeTask<?> task = builder.schedule();
+        return task.id();
+    }
+
     protected void removeIndexLeft(ConditionQuery query, HugeElement element) {
         if (element.type() != HugeType.VERTEX &&
             element.type() != HugeType.EDGE_OUT &&
@@ -88,7 +107,6 @@ public class GraphIndexTransaction extends AbstractTransaction {
                                     element.type());
         }
 
-        // TODO: remove left index in async thread
         for (ConditionQuery cq: ConditionQueryFlatten.flatten(query)) {
             // Process range index
             this.processRangeIndexLeft(cq, element);
@@ -124,6 +142,12 @@ public class GraphIndexTransaction extends AbstractTransaction {
                     index.resetElementIds();
                     index.elementIds(element.id());
                     this.doEliminate(this.serializer.writeIndex(index));
+                    this.commit();
+                    // If deleted by error, re-add deleted index again
+                    if (this.deletedByError(q, element)) {
+                        this.doAppend(this.serializer.writeIndex(index));
+                        this.commit();
+                    }
                 }
             }
         }
@@ -131,30 +155,20 @@ public class GraphIndexTransaction extends AbstractTransaction {
 
     private void processSecondaryOrSearchIndexLeft(ConditionQuery query,
                                                    HugeElement element) {
-        HugeElement deletion = element.copyAsFresh();
-        Set<Id> propKeys = query.userpropKeys();
-        Set<Id> incorrectPKs = InsertionOrderUtil.newSet();
-        for (Id key : propKeys) {
-            Set<Object> conditionValues = query.userpropValues(key);
-            E.checkState(!conditionValues.isEmpty(),
-                         "Expect user property values for key '%s', " +
-                         "but got none", key);
-            if (conditionValues.size() > 1) {
-                // It's inside/between Query (processed in range index)
-                return;
-            }
-            Object propValue = deletion.getProperty(key).value();
-            Object conditionValue = conditionValues.iterator().next();
-            if (!propValue.equals(conditionValue)) {
-                PropertyKey pkey = this.graph().propertyKey(key);
-                deletion.addProperty(pkey, conditionValue);
-                incorrectPKs.add(key);
-            }
+        Map<PropertyKey, Object> incorrectPKs = InsertionOrderUtil.newMap();
+        HugeElement deletion = this.constructErrorElem(query, element,
+                                                       incorrectPKs);
+        if (deletion == null) {
+            return;
         }
-
         // Delete unused index
         for (IndexLabel il : relatedIndexLabels(deletion)) {
-            if (!CollectionUtil.hasIntersection(il.indexFields(), incorrectPKs)) {
+            Set<Id> incorrectPkIds = incorrectPKs.keySet().stream()
+                                                 .map(PropertyKey::id)
+                                                 .collect(Collectors.toSet());
+            Collection<Id> incorrectIndexFields = CollectionUtil.intersect(
+                           il.indexFields(), incorrectPkIds);
+            if (incorrectIndexFields.isEmpty()) {
                 continue;
             }
             // Skip if search index is not wrong
@@ -181,6 +195,12 @@ public class GraphIndexTransaction extends AbstractTransaction {
                  * so rebuild the index again with the correct property.
                  */
                 this.updateIndex(il.id(), element, false);
+            }
+            this.commit();
+            if (this.deletedByError(element, incorrectIndexFields,
+                                    incorrectPKs)) {
+                this.updateIndex(il.id(), deletion, false);
+                this.commit();
             }
         }
     }
@@ -303,6 +323,70 @@ public class GraphIndexTransaction extends AbstractTransaction {
         } else {
             this.doAppend(this.serializer.writeIndex(index));
         }
+    }
+
+    private HugeElement constructErrorElem(
+                        ConditionQuery query, HugeElement element,
+                        Map<PropertyKey, Object> incorrectPKs) {
+        HugeElement errorElem = element.copyAsFresh();
+        Set<Id> propKeys = query.userpropKeys();
+        for (Id key : propKeys) {
+            Set<Object> conditionValues = query.userpropValues(key);
+            E.checkState(!conditionValues.isEmpty(),
+                         "Expect user property values for key '%s', " +
+                         "but got none", key);
+            if (conditionValues.size() > 1) {
+                // It's inside/between Query (processed in range index)
+                return null;
+            }
+            Object propValue = errorElem.getProperty(key).value();
+            Object conditionValue = conditionValues.iterator().next();
+            if (!propValue.equals(conditionValue)) {
+                PropertyKey pkey = this.graph().propertyKey(key);
+                errorElem.addProperty(pkey, conditionValue);
+                incorrectPKs.put(pkey, conditionValue);
+            }
+        }
+        return errorElem;
+    }
+
+    private boolean deletedByError(ConditionQuery query, HugeElement element) {
+        HugeElement elem = this.newestElement(element);
+        if (elem == null) {
+            return false;
+        }
+        return query.test(elem);
+    }
+
+    private boolean deletedByError(HugeElement element, Collection<Id> ilFields,
+                                   Map<PropertyKey, Object> incorrectPKs) {
+        HugeElement elem = this.newestElement(element);
+        for (Map.Entry<PropertyKey, Object> e : incorrectPKs.entrySet()) {
+            PropertyKey pk = e.getKey();
+            Object value = e.getValue();
+            if (ilFields.contains(pk.id()) &&
+                value.equals(elem.getPropertyValue(pk.id()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private HugeElement newestElement(HugeElement element) {
+        boolean isVertex = element instanceof HugeVertex;
+        if (isVertex) {
+            Iterator<Vertex> iterV = this.graph().vertices(element.id());
+            if (iterV.hasNext()) {
+                return (HugeVertex) iterV.next();
+            }
+        } else {
+            assert element instanceof HugeEdge;
+            Iterator<Edge> iterE = this.graph().edges(element.id());
+            if (iterE.hasNext()) {
+                return (HugeEdge) iterE.next();
+            }
+        }
+        return null;
     }
 
     /**
@@ -1090,10 +1174,39 @@ public class GraphIndexTransaction extends AbstractTransaction {
         }
     }
 
-    public static enum OptimizedType {
+    public enum OptimizedType {
         NONE,
         PRIMARY_KEY,
         SORT_KEY,
         INDEX
+    }
+
+    public static class RemoveLeftIndexCallable extends EphemeralJob<Object> {
+
+        private static final String REMOVE_LEFT_INDEX = "remove_left_index";
+
+        private ConditionQuery query;
+        private HugeElement element;
+
+        private RemoveLeftIndexCallable(ConditionQuery query,
+                                        HugeElement element) {
+            E.checkArgumentNotNull(query, "query");
+            E.checkArgumentNotNull(element, "element");
+            this.query = query;
+            this.element = element;
+        }
+
+        @Override
+        public String type() {
+            return REMOVE_LEFT_INDEX;
+        }
+
+        @Override
+        public Object execute() {
+            GraphIndexTransaction tx = this.graph().graphTransaction()
+                                                   .indexTransaction();
+            tx.removeIndexLeft(this.query, this.element);
+            return null;
+        }
     }
 }
